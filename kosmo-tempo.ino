@@ -1,8 +1,11 @@
-#include "Shared.h"
+#include "Common.h"
+#include "Models.h"
+#include "KosmoSlaveI2CService.h"
+//#include "Shared.h"
 #include "DebounceButton165.h"
 #include <SoftwareSerial.h>
 #include "AnalogInput.h"
-#include "kosmo-comm-slave.h"
+//#include "kosmo-comm-slave.h"
 
 #define LED_DATA_PIN 7 // 595/14
 #define LED_LATCH_PIN 6 // 595/12
@@ -61,6 +64,11 @@ State state = STOPPED;
 bool morphEnabledSetFromMaster = false;
 bool prevMorphEnabledState = false;
 
+KosmoSlaveI2CService<ClockPart> slave(8);
+bool newPartData = false;
+bool stopTheClock = false;
+bool startTheClock = false;
+int currentPartIndex = -1;
 
 //bool clockOutActive = false;
 uint8_t ppqnPulses = 0;
@@ -135,7 +143,7 @@ void setBpm(uint16_t bpm) {
   if (bpm < 40) bpm = 40;
   if (bpm > 240) bpm = 240;
   currentBpm = bpm;
-  registers.bpm = bpm;
+  slave.current.bpm = bpm;
 
   // microseconds per MIDI clock tick (24 ppqn)
   unsigned long usPerQuarter = 60000000UL / bpm;
@@ -166,12 +174,53 @@ void setup() {
   digitalWrite(RESET_OUT_PIN, LOW);
 
   // i2c comm
-  setupSlave(INIT_BPM, morphTargetBpm, morphBars, morphEnabled);
+  //setupSlave(INIT_BPM, morphTargetBpm, morphBars, morphEnabled);
+  slave.onSongPartsReceived(onSongPartsReceived);
+  slave.onPartIndexChanged(onPartIndexChanged);
+  slave.onStart(onStart);
+  slave.onStop(onStop);
+  slave.onAutomation(onAutomation);  
+
 
   tempoPot.Begin(720);
   morphPot.Begin(4);
 
   Serial.println("Clock ready");
+}
+
+void onSongPartsReceived() {
+  currentPartIndex = 0;
+  newPartData = true;
+  if(state==STOPPED) {
+    ClockPart part = slave.getPart(currentPartIndex);
+    setBpm(part.bpm);   
+    morphTargetBpm = part.morphTargetBpm;
+    morphBars = part.morphBars;
+    morphEnabled = part.morphEnabled;
+    morphEnabledSetFromMaster = true;
+    setupMorphing(state == PLAYING && morphEnabled);     
+  }
+}
+
+void onPartIndexChanged(const int partIndex) {
+  currentPartIndex = partIndex;
+  newPartData = true;
+}
+
+void onStart() {
+  startTheClock = true;
+  stopTheClock = false;
+}
+
+void onStop() {
+  stopTheClock = true;
+  startTheClock = false;
+}
+
+void onAutomation(Automation automation) {
+  char s[100];
+  sprintf(s, "automation => target: %d value: %d", automation.target, automation.value);
+  Serial.println(s);
 }
 
 void midiSend(uint8_t data) {
@@ -246,52 +295,44 @@ void scanInputs() {
 
     if(!morphEnabledSetFromMaster) { // only update if not set from master, or if it was changed after set from master
       morphEnabled = morphEnabledState;
-      registers.morphEnabled = morphEnabledState;
+      slave.current.morphEnabled = morphEnabledState;
     }
 
     tapButton.update(incoming, now);
+    startButton.update(incoming, now);
+    stopButton.update(incoming, now);
+    syncButton.update(incoming, now);
+    morphButton.update(incoming, now);
 
-    if(programming) {
-      if(tapButton.wasPressed()) {
-        Serial.println("we are in programming mode and the tap button has been pressed");
-        readyToSendRegisters = true;
+    if(tapButton.wasPressed()) {
+      registerTap(now);
+    }
+  
+    if(startButton.wasPressed()) {
+      if(state == STOPPED) {
+        start();
+      } else if(state == PLAYING) {
+        pause();
+      } else if(state == PAUSED) {
+        resume();
       }
-      
-    } else {
-      startButton.update(incoming, now);
-      stopButton.update(incoming, now);
-      syncButton.update(incoming, now);
-      morphButton.update(incoming, now);
+    } 
+    if(stopButton.wasPressed()) {
+        stop();
+    }
+    if(syncButton.wasPressed() && state == PLAYING) {
+        state = PLAYING;
+        digitalWrite(RESET_OUT_PIN, HIGH);
+        midiStart();
+        resetOut = true;
+        resetOutLed = true;
+        lastResetOut = now;     
+        ppqnPulses = 0;
+    }
+    if(morphButton.wasPressed() && morphEnabled) {
+      setupMorphing(!morphInProgress);
+    }
 
-      if(tapButton.wasPressed()) {
-        registerTap(now);
-      }
-    
-      if(startButton.wasPressed()) {
-        if(state == STOPPED) {
-          start();
-        } else if(state == PLAYING) {
-          pause();
-        } else if(state == PAUSED) {
-          resume();
-        }
-      } 
-      if(stopButton.wasPressed()) {
-          stop();
-      }
-      if(syncButton.wasPressed() && state == PLAYING) {
-          state = PLAYING;
-          digitalWrite(RESET_OUT_PIN, HIGH);
-          midiStart();
-          resetOut = true;
-          resetOutLed = true;
-          lastResetOut = now;     
-          ppqnPulses = 0;
-      }
-      if(morphButton.wasPressed() && morphEnabled) {
-        setupMorphing(!morphInProgress);
-      }
-    } // programming
     
 
 
@@ -379,7 +420,7 @@ void displayValues(int val3, int val2) {
 
     if (d < 3) {
       // 3-digit display
-      int digitVal = (!programming) ? getDigit(val3, d) : getProgrammingDigit(d);
+      int digitVal = getDigit(val3, d);
       sr3 = digitToSegment[digitVal];
       sr1 = digitEnable_3digit[d];
     } else {
@@ -402,14 +443,10 @@ void displayValues(int val3, int val2) {
 }
 
 void updateUI() {
-  if(programming) {
-    displayValues(0, morphBars);
-  } else {
-    int bpmToDisplay = currentBpm;
-    if(morphEnabled && !morphInProgress)
-      bpmToDisplay = morphTargetBpm;
-    displayValues(bpmToDisplay, morphBars);
-  }
+  int bpmToDisplay = currentBpm;
+  if(morphEnabled && !morphInProgress)
+    bpmToDisplay = morphTargetBpm;
+  displayValues(bpmToDisplay, morphBars);
 }
 
 
@@ -437,14 +474,14 @@ void loop() {
       uint16_t morphBarsRaw;
       if(morphPot.Changed(now, morphBarsRaw)) {
         morphBars = map(morphBarsRaw, 1024, 0, 16, 0);
-        registers.morphBars = morphBars;
+        slave.current.morphBars = morphBars;
       }
 
       uint16_t bpmRaw;
       if(tempoPot.Changed(now, bpmRaw)) {
         if(morphEnabled) {
           morphTargetBpm = mapPotToBpm(bpmRaw);
-          registers.morphTargetBpm = morphTargetBpm;
+          slave.current.morphTargetBpm = morphTargetBpm;
         } else {
           setBpm(mapPotToBpm(bpmRaw));
         }
@@ -508,13 +545,15 @@ void loop() {
     midiClockPending = false;
   }
 
-  if(newPartData && (state != PLAYING || currentStep == STEPS_PR_BAR - 1)) {
+  if(newPartData && currentPartIndex >= 0 && (state != PLAYING || currentStep == STEPS_PR_BAR - 1)) {
     newPartData = false;
 
-    setBpm(nextRegisters.bpm);
-    morphTargetBpm = nextRegisters.morphTargetBpm;
-    morphBars = nextRegisters.morphBars;
-    morphEnabled = nextRegisters.morphEnabled;
+    ClockPart part = slave.getPart(currentPartIndex);
+
+    setBpm(part.bpm);
+    morphTargetBpm = part.morphTargetBpm;
+    morphBars = part.morphBars;
+    morphEnabled = part.morphEnabled;
     morphEnabledSetFromMaster = true;
     setupMorphing(state == PLAYING && morphEnabled);   
 
