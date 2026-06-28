@@ -4,7 +4,7 @@
 #define I2C_MAX 32
 //#define I2C_CHUNK_MAX 25
 #define DRUM_CHANNELS 5
-#define PARTS 8
+#define PARTS 16
 #define PPQN 24.0
 #define PPQN_PR_BEAT 6
 #define STEPS_PR_BAR 16
