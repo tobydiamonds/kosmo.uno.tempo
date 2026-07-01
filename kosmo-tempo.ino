@@ -69,6 +69,7 @@ bool newPartData = false;
 bool stopTheClock = false;
 bool startTheClock = false;
 int currentPartIndex = -1;
+bool verboseMode = false;
 
 //bool clockOutActive = false;
 uint8_t ppqnPulses = 0;
@@ -150,6 +151,11 @@ void setBpm(uint16_t bpm) {
   unsigned long usPerTick = usPerQuarter / PPQN;
 
   setupTimer1(usPerTick);
+
+  if(verboseMode) {
+    Serial.print(F("BPM:"));
+    Serial.println(bpm);
+  }
 }
 
 void setup() {
@@ -248,6 +254,7 @@ uint8_t read165byte() {
 void start() {
   state = PLAYING;
   midiStart();
+  if(verboseMode) Serial.println(F("STATE:PLAYING"));
 }
 
 void stop() {
@@ -260,18 +267,21 @@ void stop() {
   ppqnPulses = 0;
   morphChangePrBeat = 0;
   morphRemaining = 0;
-  morphInProgress = false;        
-  currentStep = 0;  
+  morphInProgress = false;
+  currentStep = 0;
+  if(verboseMode) Serial.println(F("STATE:STOPPED"));
 }
 
 void pause() {
-  state = PAUSED;        
+  state = PAUSED;
   midiStop();
+  if(verboseMode) Serial.println(F("STATE:PAUSED"));
 }
 
 void resume() {
-  state = PLAYING;             
+  state = PLAYING;
   midiContinue();
+  if(verboseMode) Serial.println(F("STATE:PLAYING"));
 }
 
 void scanInputs() {
@@ -450,6 +460,17 @@ void updateUI() {
 }
 
 
+void printStatus() {
+  Serial.print(F("bpm:"));
+  Serial.print(currentBpm);
+  Serial.print(F(" state:"));
+  Serial.print(state == PLAYING ? F("PLAYING") : (state == PAUSED ? F("PAUSED") : F("STOPPED")));
+  Serial.print(F(" step:"));
+  Serial.print(currentStep);
+  Serial.print(F(" morph:"));
+  Serial.println(morphInProgress ? F("yes") : F("no"));
+}
+
 void loop() {
   now = millis();
 
@@ -496,8 +517,13 @@ void loop() {
     }
     //clockOutActive = true;
     clockOutLed = (ppqnPulses == 0); // turn on led every beat
-    if(clockOutLed)
+    if(clockOutLed) {
       lastClockOutLed = now;
+      if(verboseMode) {
+        Serial.print(F("BEAT:"));
+        Serial.println(currentStep);
+      }
+    }
 
     if(morphChangePending) {
       morphChangePending = false;
@@ -563,7 +589,35 @@ void loop() {
 
   updateUI();
 
-  
+  slave.printPendingRx();
+
+  // serial command handling
+  {
+    static char cmdBuf[12];
+    static uint8_t cmdIdx = 0;
+    while(Serial.available()) {
+      char c = Serial.read();
+      if(c == '\n' || c == '\r') {
+        if(cmdIdx > 0) {
+          cmdBuf[cmdIdx] = '\0';
+          if(strcmp_P(cmdBuf, PSTR("verbose on")) == 0) {
+            verboseMode = true;
+            slave.verbose = true;
+            Serial.println(F("VERBOSE ON"));
+          } else if(strcmp_P(cmdBuf, PSTR("verbose off")) == 0) {
+            verboseMode = false;
+            slave.verbose = false;
+            Serial.println(F("VERBOSE OFF"));
+          } else if(strcmp_P(cmdBuf, PSTR("status")) == 0) {
+            printStatus();
+          }
+          cmdIdx = 0;
+        }
+      } else if(cmdIdx < sizeof(cmdBuf)-1) {
+        cmdBuf[cmdIdx++] = c;
+      }
+    }
+  }
 }
 
 int mapPotToBpm(int analogVal) {
